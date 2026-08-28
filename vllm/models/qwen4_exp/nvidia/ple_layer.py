@@ -718,7 +718,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             retained: set[str] = set()
             quant_method = self._offload_quant_method
             if isinstance(quant_method, Qwen4ExpPLEFp8EmbeddingMethod):
+                saw_table = False
                 for name, loaded_weight in weights:
+                    if name.startswith("ngram_embedding.shard_"):
+                        saw_table = True
+                        continue
                     if name != "ngram_embedding.weight_scale":
                         continue
                     self.register_buffer(
@@ -729,11 +733,19 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                         persistent=False,
                     )
                     retained.add(name)
-                if not retained:
+                # AutoWeightsLoader dispatches contiguous prefix groups, so this
+                # runs once per group. A checkpoint that splits the PLE across
+                # files -- plain buffers in the bf16 shards, the table and its
+                # scale in dedicated FP8 shards -- reaches here first with no
+                # table at all. Only the group carrying the table owes a scale.
+                if saw_table and not retained:
                     raise ValueError("FP8 PLE offload checkpoint is missing its scale")
             elif isinstance(quant_method, Qwen4ExpPLENVFp4EmbeddingMethod):
                 outer_scales: dict[int, torch.Tensor] = {}
+                saw_table = False
                 for name, loaded_weight in weights:
+                    if name.startswith("ngram_embedding.shard_"):
+                        saw_table = True
                     if not name.startswith(
                         "ngram_embedding.shard_"
                     ) or not name.endswith(".weight_scale_2"):
@@ -744,7 +756,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     shard_index = int(shard_text)
                     outer_scales[shard_index] = loaded_weight
                     retained.add(name)
+                # Same grouping caveat as the FP8 branch above.
                 if not retained:
+                    if not saw_table:
+                        return retained
                     raise ValueError(
                         "NVFP4 PLE offload checkpoint is missing its global scale"
                     )
