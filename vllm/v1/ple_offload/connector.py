@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exchange PLE data between a GPU worker and the CPU-offload process."""
 
+import contextlib
 import os
 import queue
 import threading
@@ -35,6 +36,30 @@ def _cuda_check(result: Any, operation: str) -> Any:
     if error.value != 0:
         raise RuntimeError(f"{operation} failed: {error}")
     return result
+
+
+@contextlib.contextmanager
+def _classic_cuda_segments():
+    """Allocate outside PyTorch's expandable-segments pool for the duration.
+
+    Expandable segments are backed by CUDA VMM, so sharing such a tensor takes
+    PyTorch's fabric-handle path: the producer's shareable file descriptor is
+    pulled across with ``pidfd_getfd``. The PLE offload worker is a sibling of
+    the GPU worker rather than a descendant, so under the default
+    ``kernel.yama.ptrace_scope=1`` that call fails with EPERM. Classic segments
+    share through ``cudaIpcMemHandle`` instead, which needs no FD passing.
+    """
+    conf = os.environ.get("PYTORCH_ALLOC_CONF", "") + os.environ.get(
+        "PYTORCH_CUDA_ALLOC_CONF", ""
+    )
+    if "expandable_segments:True" not in conf:
+        yield
+        return
+    torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+    try:
+        yield
+    finally:
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 
 
 class PleOffloadConnector:
@@ -147,17 +172,20 @@ class PleOffloadConnector:
             if vllm_config.load_config.load_format == "dummy":
                 layer.initialize_dummy_offload_metadata(self.device)
             # The CPU worker writes results here through CUDA IPC. The GPU
-            # placeholder waits on the paired cross-process semaphore.
-            output_buffer = torch.empty(
-                max_num_tokens,
-                layer.get_offload_output_dim(int(config.ple_embed_dim)),
-                dtype=layer.get_offload_output_dtype(vllm_config.model_config.dtype),
-                device=self.device,
-            )
-            layer.setup_cross_process_offload(
-                output_buffer,
-                CpuGpuSemaphore(self.device),
-            )
+            # placeholder waits on the paired cross-process semaphore. Both
+            # tensors cross a process boundary, so neither may come from an
+            # expandable segment.
+            with _classic_cuda_segments():
+                output_buffer = torch.empty(
+                    max_num_tokens,
+                    layer.get_offload_output_dim(int(config.ple_embed_dim)),
+                    dtype=layer.get_offload_output_dtype(
+                        vllm_config.model_config.dtype
+                    ),
+                    device=self.device,
+                )
+                semaphore = CpuGpuSemaphore(self.device)
+            layer.setup_cross_process_offload(output_buffer, semaphore)
         return layers
 
     def _pin_input_buffers(self) -> None:
