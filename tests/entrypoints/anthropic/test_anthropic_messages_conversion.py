@@ -15,6 +15,7 @@ Also covers cache usage computation in ``_build_anthropic_usage``.
 import json
 from argparse import Namespace
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import Annotated
 from unittest.mock import MagicMock
 
@@ -26,6 +27,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from vllm.entrypoints.anthropic.api_router import attach_router
 from vllm.entrypoints.anthropic.protocol import (
+    AnthropicCountTokensRequest,
     AnthropicMessagesRequest,
 )
 from vllm.entrypoints.anthropic.serving import (
@@ -60,7 +62,7 @@ def _make_request(
 ) -> AnthropicMessagesRequest:
     return AnthropicMessagesRequest(
         model="test-model",
-        max_tokens=128,
+        max_tokens=kwargs.pop("max_tokens", 128),
         messages=messages,
         **kwargs,
     )
@@ -1701,3 +1703,309 @@ class TestClientErrorResponses:
 
         assert response.status_code == HTTPStatus.BAD_REQUEST
         assert response.json()["error"]["type"] == "BadRequestError"
+
+
+# ======================================================================
+# Extended thinking: thinking config, effort, and display
+# ======================================================================
+
+
+# Mirrors the Qwen templates: only low|medium|xhigh are accepted.
+EFFORT_TEMPLATE = (
+    "{%- if reasoning_effort is defined and reasoning_effort is not none %}"
+    "{%- if reasoning_effort not in ['low', 'medium', 'xhigh'] %}"
+    "{{- raise_exception('Unsupported reasoning_effort.') }}"
+    "{%- endif %}"
+    "{%- endif %}"
+    "{%- for message in messages %}{{- message.content }}{%- endfor %}"
+)
+
+_SUPPORTED = frozenset({"low", "medium", "xhigh"})
+
+
+def _kwargs(req) -> dict:
+    return req.chat_template_kwargs or {}
+
+
+def _resolve(**fields):
+    return _convert(
+        _make_request([{"role": "user", "content": "hi"}], **fields),
+        supported_efforts=_SUPPORTED,
+    )
+
+
+class TestThinkingConfigValidation:
+    """The Anthropic spec ties budget_tokens to type='enabled' only: adaptive
+    takes its depth from output_config.effort instead, and sending a budget
+    alongside it is a 400 on the real API."""
+
+    @pytest.mark.parametrize("thinking_type", ["adaptive", "disabled"])
+    def test_budget_tokens_rejected_outside_enabled(self, thinking_type):
+        with pytest.raises(ValidationError, match="budget_tokens is not supported"):
+            _make_request(
+                [{"role": "user", "content": "hi"}],
+                max_tokens=16000,
+                thinking={"type": thinking_type, "budget_tokens": 4096},
+            )
+
+    def test_enabled_requires_budget_tokens(self):
+        with pytest.raises(ValidationError, match="budget_tokens is required"):
+            _make_request(
+                [{"role": "user", "content": "hi"}], thinking={"type": "enabled"}
+            )
+
+    def test_budget_tokens_below_minimum_rejected(self):
+        with pytest.raises(ValidationError, match="greater than or equal to 1024"):
+            _make_request(
+                [{"role": "user", "content": "hi"}],
+                thinking={"type": "enabled", "budget_tokens": 512},
+            )
+
+    def test_budget_tokens_must_be_less_than_max_tokens(self):
+        with pytest.raises(ValidationError, match="less than max_tokens"):
+            AnthropicMessagesRequest(
+                model="test-model",
+                max_tokens=4096,
+                messages=[{"role": "user", "content": "hi"}],
+                thinking={"type": "enabled", "budget_tokens": 4096},
+            )
+
+    def test_display_rejected_when_disabled(self):
+        with pytest.raises(ValidationError, match="display is not supported"):
+            _make_request(
+                [{"role": "user", "content": "hi"}],
+                thinking={"type": "disabled", "display": "summarized"},
+            )
+
+
+class TestThinkingResolution:
+    def test_omitted_thinking_leaves_template_default(self):
+        """No thinking field must not pin enable_thinking either way -- the
+        chat template's own default decides, and reasoning is still returned."""
+        req = _resolve()
+
+        assert "enable_thinking" not in _kwargs(req)
+        assert req.include_reasoning is True
+        assert req.reasoning_effort is None
+
+    @pytest.mark.parametrize("thinking_type", ["adaptive", "enabled"])
+    def test_thinking_on_enables_template_thinking(self, thinking_type):
+        thinking = {"type": thinking_type}
+        if thinking_type == "enabled":
+            thinking["budget_tokens"] = 1024
+        req = _resolve(thinking=thinking, max_tokens=16000)
+
+        assert _kwargs(req)["enable_thinking"] is True
+        assert req.include_reasoning is True
+
+    def test_enabled_budget_maps_to_thinking_token_budget(self):
+        req = _resolve(
+            thinking={"type": "enabled", "budget_tokens": 4096}, max_tokens=16000
+        )
+
+        assert req.thinking_token_budget == 4096
+
+    def test_adaptive_has_no_token_budget(self):
+        """Adaptive depth comes from effort, so nothing should reach the
+        sampler's thinking_token_budget."""
+        req = _resolve(thinking={"type": "adaptive"})
+
+        assert req.thinking_token_budget is None
+
+    def test_disabled_suppresses_and_strips_reasoning(self):
+        req = _resolve(thinking={"type": "disabled"})
+
+        assert _kwargs(req)["enable_thinking"] is False
+        assert req.include_reasoning is False
+        assert req.reasoning_effort is None
+
+    def test_disabled_wins_over_effort(self):
+        req = _resolve(
+            thinking={"type": "disabled"}, output_config={"effort": "medium"}
+        )
+
+        assert _kwargs(req)["enable_thinking"] is False
+        assert req.reasoning_effort is None
+
+    def test_caller_enable_thinking_not_overridden(self):
+        """An explicit chat_template_kwargs from the caller is authoritative."""
+        req = _resolve(
+            thinking={"type": "adaptive"},
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        assert _kwargs(req)["enable_thinking"] is False
+
+
+class TestThinkingDisplay:
+    """display controls whether reasoning is returned, not whether it happens:
+    thinking is generated and billed under either setting."""
+
+    def test_omitted_display_drops_reasoning_but_keeps_thinking_on(self):
+        req = _resolve(thinking={"type": "adaptive", "display": "omitted"})
+
+        assert _kwargs(req)["enable_thinking"] is True
+        assert req.include_reasoning is False
+
+    def test_summarized_display_returns_reasoning(self):
+        req = _resolve(thinking={"type": "adaptive", "display": "summarized"})
+
+        assert req.include_reasoning is True
+
+    def test_default_display_returns_reasoning(self):
+        req = _resolve(thinking={"type": "adaptive"})
+
+        assert req.include_reasoning is True
+
+
+class TestEffortClamping:
+    @pytest.mark.parametrize(
+        "requested,expected",
+        [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "xhigh"),
+            ("xhigh", "xhigh"),
+            ("max", "xhigh"),
+        ],
+    )
+    def test_clamped_to_template_ladder(self, requested, expected):
+        """A spec-legal effort the template rejects must clamp rather than
+        raise, searching upward first so max does not collapse to low."""
+        req = _resolve(output_config={"effort": requested})
+
+        assert req.reasoning_effort == expected
+
+    def test_template_ignoring_effort_accepts_all(self):
+        supported = AnthropicServingMessages._detect_supported_reasoning_efforts(
+            "{%- for message in messages %}{{- message.content }}{%- endfor %}"
+        )
+
+        assert {"low", "medium", "high", "xhigh", "max"} <= supported
+
+    def test_qwen_style_template_ladder_detected(self):
+        supported = AnthropicServingMessages._detect_supported_reasoning_efforts(
+            EFFORT_TEMPLATE
+        )
+
+        assert supported == _SUPPORTED
+
+    def test_no_template_accepts_all(self):
+        supported = AnthropicServingMessages._detect_supported_reasoning_efforts(None)
+
+        assert {"low", "medium", "high", "xhigh", "max"} <= supported
+
+
+class TestSamplingParamPassthrough:
+    """Sampling params absent from the Anthropic spec must still reach vLLM."""
+
+    def test_extended_sampling_params_are_forwarded(self):
+        req = _resolve(
+            temperature=0.7,
+            top_p=0.8,
+            top_k=20,
+            min_p=0.05,
+            presence_penalty=1.5,
+            frequency_penalty=0.5,
+            repetition_penalty=1.1,
+        )
+
+        assert req.temperature == 0.7
+        assert req.top_p == 0.8
+        assert req.top_k == 20
+        assert req.min_p == 0.05
+        assert req.presence_penalty == 1.5
+        assert req.frequency_penalty == 0.5
+        assert req.repetition_penalty == 1.1
+
+    def test_omitted_params_keep_server_defaults(self):
+        """None must survive for the params that fall back to
+        --override-generation-config, while the penalties keep the upstream
+        0.0 that goes straight to the sampler."""
+        req = _resolve()
+
+        assert req.temperature is None
+        assert req.top_p is None
+        assert req.top_k is None
+        assert req.min_p is None
+        assert req.repetition_penalty is None
+        assert req.presence_penalty == 0.0
+        assert req.frequency_penalty == 0.0
+
+
+class TestCountTokensThinking:
+    """Token counts must reflect the prompt that will actually be rendered."""
+
+    def test_thinking_and_effort_carried_through(self):
+        req = _convert(
+            AnthropicCountTokensRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                thinking={"type": "adaptive"},
+                output_config={"effort": "max"},
+            ),
+            supported_efforts=_SUPPORTED,
+        )
+
+        assert _kwargs(req)["enable_thinking"] is True
+        assert req.reasoning_effort == "xhigh"
+
+    def test_disabled_thinking_carried_through(self):
+        req = _convert(
+            AnthropicCountTokensRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                thinking={"type": "disabled"},
+            ),
+            supported_efforts=_SUPPORTED,
+        )
+
+        assert _kwargs(req)["enable_thinking"] is False
+
+
+class TestEffortProbeTemplateResolution:
+    """``--chat-template`` is normally unset, leaving the real template on the
+    tokenizer. Probing only the constructor argument saw None, concluded every
+    effort was supported, and silently disabled clamping on a live server.
+    """
+
+    @staticmethod
+    def _handler(chat_template, tokenizer_template):
+        handler = object.__new__(AnthropicServingMessages)
+        handler.chat_template = chat_template
+        handler.renderer = SimpleNamespace(
+            tokenizer=SimpleNamespace(chat_template=tokenizer_template)
+        )
+        handler._supported_efforts_cache = None
+        return handler
+
+    def test_falls_back_to_tokenizer_template(self):
+        handler = self._handler(None, EFFORT_TEMPLATE)
+
+        assert handler._effective_chat_template() == EFFORT_TEMPLATE
+        assert handler._get_supported_efforts() == _SUPPORTED
+
+    def test_explicit_chat_template_wins(self):
+        explicit = "{%- for m in messages %}{{- m.content }}{%- endfor %}"
+        handler = self._handler(explicit, EFFORT_TEMPLATE)
+
+        assert handler._effective_chat_template() == explicit
+        assert "max" in handler._get_supported_efforts()
+
+    def test_probe_is_cached(self):
+        handler = self._handler(None, EFFORT_TEMPLATE)
+        first = handler._get_supported_efforts()
+        handler.renderer.tokenizer.chat_template = "{{ '' }}"
+
+        assert handler._get_supported_efforts() is first
+
+    @pytest.mark.parametrize("tokenizer_template", [None, {"default": "x"}])
+    def test_unusable_tokenizer_template_falls_back_to_full_ladder(
+        self, tokenizer_template
+    ):
+        """Mistral-style tokenizers expose no string template; the clamp must
+        become an identity rather than raise."""
+        handler = self._handler(None, tokenizer_template)
+
+        assert handler._effective_chat_template() is None
+        assert {"low", "high", "max"} <= handler._get_supported_efforts()

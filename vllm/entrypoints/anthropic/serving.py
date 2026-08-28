@@ -10,6 +10,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import datetime
 from typing import Any
 
 import jinja2
@@ -47,9 +48,23 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse, UsageInfo
 from vllm.entrypoints.serve.exception_handling.utils import sanitize_message
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.renderers.hf import AssistantTracker
 from vllm.renderers.online_renderer import OnlineRenderer
 
 logger = logging.getLogger(__name__)
+
+# Ordered weakest to strongest, matching ChatCompletionRequest.reasoning_effort.
+# Anthropic's output_config.effort only spans low..max; the extra rungs are
+# clamp targets for templates whose own ladder is narrower.
+_REASONING_EFFORT_LADDER = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
 
 
 def _build_anthropic_usage(
@@ -138,6 +153,86 @@ class AnthropicServingMessages(OpenAIServingChat):
             "tool_calls": "tool_use",
         }
         self._merge_inline_system = self._detect_merge_inline_system(chat_template)
+        self._supported_efforts_cache: frozenset[str] | None = None
+
+    def _effective_chat_template(self) -> str | None:
+        """The template that will actually render, not just ``--chat-template``.
+
+        That flag is usually unset, leaving the template on the tokenizer,
+        which is only reachable once the engine is up.
+        """
+        if self.chat_template:
+            return self.chat_template
+        tokenizer = getattr(self.renderer, "tokenizer", None)
+        template = getattr(tokenizer, "chat_template", None)
+        return template if isinstance(template, str) else None
+
+    def _get_supported_efforts(self) -> frozenset[str]:
+        """Probe the effective template once, on first use."""
+        if self._supported_efforts_cache is None:
+            self._supported_efforts_cache = self._detect_supported_reasoning_efforts(
+                self._effective_chat_template()
+            )
+        return self._supported_efforts_cache
+
+    @staticmethod
+    def _detect_supported_reasoning_efforts(
+        chat_template: str | None,
+    ) -> frozenset[str]:
+        """Auto-detect which ``reasoning_effort`` values the template accepts.
+
+        Templates such as Qwen's ``raise_exception`` for efforts outside their
+        own ladder, so a spec-legal ``effort`` would otherwise 500. Rendering a
+        minimal conversation once per candidate tells us which values are safe;
+        templates that ignore ``reasoning_effort`` accept all of them, making
+        the clamp an identity.
+        """
+        if not chat_template:
+            return frozenset(_REASONING_EFFORT_LADDER)
+        try:
+            env = jinja2.sandbox.ImmutableSandboxedEnvironment(
+                trim_blocks=True,
+                lstrip_blocks=True,
+                extensions=[AssistantTracker, jinja2.ext.loopcontrols],
+            )
+            # Supplied by transformers at render time; templates that call it
+            # would otherwise fail the probe for an unrelated reason.
+            env.globals["strftime_now"] = lambda fmt: datetime.now().strftime(fmt)
+            template = env.from_string(chat_template)
+        except jinja2.TemplateError:
+            return frozenset(_REASONING_EFFORT_LADDER)
+
+        supported = set()
+        for effort in _REASONING_EFFORT_LADDER:
+            try:
+                template.render(
+                    messages=[{"role": "user", "content": "t"}],
+                    add_generation_prompt=True,
+                    reasoning_effort=effort,
+                )
+                supported.add(effort)
+            except jinja2.TemplateError:
+                continue
+        return frozenset(supported) or frozenset(_REASONING_EFFORT_LADDER)
+
+    @staticmethod
+    def _clamp_reasoning_effort(effort: str, supported: frozenset[str]) -> str:
+        """Clamp an effort to the nearest value the chat template accepts.
+
+        Searches upward along the ladder first, then downward, so an
+        unsupported ``max``/``high`` lands on the strongest available effort
+        rather than being silently weakened.
+        """
+        if effort in supported or effort not in _REASONING_EFFORT_LADDER:
+            return effort
+        index = _REASONING_EFFORT_LADDER.index(effort)
+        for candidate in _REASONING_EFFORT_LADDER[index + 1 :]:
+            if candidate in supported:
+                return candidate
+        for candidate in reversed(_REASONING_EFFORT_LADDER[:index]):
+            if candidate in supported:
+                return candidate
+        return effort
 
     @staticmethod
     def _detect_merge_inline_system(chat_template: str | None) -> bool:
@@ -195,6 +290,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         anthropic_request: AnthropicMessagesRequest | AnthropicCountTokensRequest,
         *,
         merge_inline_system: bool = False,
+        supported_efforts: frozenset[str] | None = None,
     ) -> ChatCompletionRequest:
         """Convert Anthropic message format to OpenAI format"""
         openai_messages: list[dict[str, Any]] = []
@@ -212,9 +308,61 @@ class AnthropicServingMessages(OpenAIServingChat):
         req = cls._build_base_request(anthropic_request, openai_messages)
         cls._handle_streaming_options(req, anthropic_request)
         cls._handle_output_config(req, anthropic_request)
+        cls._resolve_reasoning(
+            req,
+            anthropic_request,
+            frozenset(_REASONING_EFFORT_LADDER)
+            if supported_efforts is None
+            else supported_efforts,
+        )
         cls._convert_tool_choice(anthropic_request, req)
         cls._convert_tools(anthropic_request, req)
         return req
+
+    @classmethod
+    def _resolve_reasoning(
+        cls,
+        req: ChatCompletionRequest,
+        anthropic_request: AnthropicMessagesRequest | AnthropicCountTokensRequest,
+        supported_efforts: frozenset[str],
+    ) -> None:
+        """Map Anthropic thinking/effort onto vLLM's reasoning parameters.
+
+        ``thinking.type`` decides whether the model reasons at all,
+        ``output_config.effort`` how deeply, and ``thinking.display`` whether
+        the reasoning is returned -- it is generated and billed either way, so
+        ``display="omitted"`` drops it from the response rather than
+        suppressing it. Omitting ``thinking`` leaves ``enable_thinking``
+        unpinned so the chat template's own default stands.
+        """
+        output_config = anthropic_request.output_config
+        effort = output_config.effort if output_config else None
+        if effort is not None:
+            req.reasoning_effort = cls._clamp_reasoning_effort(
+                effort, supported_efforts
+            )
+
+        thinking = anthropic_request.thinking
+        if thinking is None:
+            return
+
+        if thinking.type == "disabled":
+            req.include_reasoning = False
+            req.reasoning_effort = "none" if "none" in supported_efforts else None
+            cls._pin_enable_thinking(req, False)
+            return
+
+        if thinking.budget_tokens is not None:
+            req.thinking_token_budget = thinking.budget_tokens
+        req.include_reasoning = thinking.display != "omitted"
+        cls._pin_enable_thinking(req, True)
+
+    @staticmethod
+    def _pin_enable_thinking(req: ChatCompletionRequest, value: bool) -> None:
+        """Set enable_thinking unless the caller passed their own."""
+        user_kwargs = req.chat_template_kwargs or {}
+        if "enable_thinking" not in user_kwargs:
+            req.chat_template_kwargs = {**user_kwargs, "enable_thinking": value}
 
     @classmethod
     def _convert_system_message(
@@ -485,6 +633,20 @@ class AnthropicServingMessages(OpenAIServingChat):
             temperature=anthropic_request.temperature,
             top_p=anthropic_request.top_p,
             top_k=anthropic_request.top_k,
+            # presence/frequency penalties reach the sampler directly, so keep
+            # the upstream 0.0 default rather than forwarding None.
+            presence_penalty=(
+                0.0
+                if anthropic_request.presence_penalty is None
+                else anthropic_request.presence_penalty
+            ),
+            frequency_penalty=(
+                0.0
+                if anthropic_request.frequency_penalty is None
+                else anthropic_request.frequency_penalty
+            ),
+            min_p=anthropic_request.min_p,
+            repetition_penalty=anthropic_request.repetition_penalty,
             cache_salt=anthropic_request.cache_salt,
             kv_transfer_params=anthropic_request.kv_transfer_params,
             ec_transfer_params=anthropic_request.ec_transfer_params,
@@ -498,9 +660,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         req: ChatCompletionRequest,
         anthropic_request: AnthropicMessagesRequest | AnthropicCountTokensRequest,
     ) -> None:
-        """Handle output configuration such as output format and effort"""
-        if isinstance(anthropic_request, AnthropicCountTokensRequest):
-            return
+        """Handle output configuration such as the response format"""
         output_config: AnthropicOutputConfig | None = anthropic_request.output_config
         if output_config and output_config.format and output_config.format.json_schema:
             req.response_format = ResponseFormat(
@@ -510,8 +670,6 @@ class AnthropicServingMessages(OpenAIServingChat):
                     name=output_config.format.type,
                 ),
             )
-        if output_config and output_config.effort is not None:
-            req.reasoning_effort = output_config.effort
 
     @classmethod
     def _handle_streaming_options(
@@ -604,6 +762,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         chat_req = self.to_chat_completion_request(
             request,
             merge_inline_system=self._merge_inline_system,
+            supported_efforts=self._get_supported_efforts(),
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Convert to OpenAI request %s", chat_req.model_dump_json())
@@ -1025,6 +1184,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         chat_req = self.to_chat_completion_request(
             request,
             merge_inline_system=self._merge_inline_system,
+            supported_efforts=self._get_supported_efforts(),
         )
         result = await self.render_chat_request(chat_req)
         if isinstance(result, ErrorResponse):

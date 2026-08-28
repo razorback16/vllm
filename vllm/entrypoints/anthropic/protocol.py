@@ -118,6 +118,36 @@ class AnthropicOutputConfig(BaseModel):
     format: AnthropicJsonOutputFormat | None = None
 
 
+class AnthropicThinkingConfig(BaseModel):
+    """Extended thinking configuration.
+
+    ``adaptive`` lets the model decide how much to think, with depth taken from
+    ``output_config.effort``. ``enabled`` is the legacy fixed-budget form and is
+    the only type that accepts ``budget_tokens``. ``display`` controls whether
+    the reasoning is returned; it is generated and billed either way.
+    """
+
+    type: Literal["enabled", "disabled", "adaptive"]
+    budget_tokens: Annotated[int, Field(ge=1024)] | None = None
+    display: Literal["summarized", "omitted"] | None = None
+
+    @model_validator(mode="after")
+    def validate_type_constraints(self) -> "AnthropicThinkingConfig":
+        if self.type == "enabled" and self.budget_tokens is None:
+            raise ValueError(
+                "budget_tokens is required when thinking type is 'enabled'"
+            )
+        if self.type != "enabled" and self.budget_tokens is not None:
+            raise ValueError(
+                f"budget_tokens is not supported when thinking type is '{self.type}'"
+            )
+        if self.type == "disabled" and self.display is not None:
+            raise ValueError(
+                "display is not supported when thinking type is 'disabled'"
+            )
+        return self
+
+
 class AnthropicMessagesRequest(BaseModel):
     """Anthropic Messages API request"""
 
@@ -132,12 +162,17 @@ class AnthropicMessagesRequest(BaseModel):
     stream: bool | None = False
     system: str | list[AnthropicContentBlock] | None = None
     temperature: float | None = None
+    thinking: AnthropicThinkingConfig | None = None
     tool_choice: AnthropicToolChoice | None = None
     tools: list[AnthropicTool] | None = None
     top_k: int | None = None
     top_p: float | None = None
 
     # vLLM-specific fields that are not in Anthropic spec
+    frequency_penalty: float | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
     cache_salt: str | None = Field(
         default=None,
         min_length=1,
@@ -189,6 +224,13 @@ class AnthropicMessagesRequest(BaseModel):
         if v <= 0:
             raise ValueError("max_tokens must be positive")
         return v
+
+    @model_validator(mode="after")
+    def validate_thinking_budget(self) -> "AnthropicMessagesRequest":
+        budget = self.thinking.budget_tokens if self.thinking else None
+        if budget is not None and budget >= self.max_tokens:
+            raise ValueError("thinking.budget_tokens must be less than max_tokens")
+        return self
 
 
 class AnthropicDelta(BaseModel):
@@ -269,7 +311,9 @@ class AnthropicCountTokensRequest(BaseModel):
 
     model: str
     messages: list[AnthropicMessage]
+    output_config: AnthropicOutputConfig | None = None
     system: str | list[AnthropicContentBlock] | None = None
+    thinking: AnthropicThinkingConfig | None = None
     tool_choice: AnthropicToolChoice | None = None
     tools: list[AnthropicTool] | None = None
 
