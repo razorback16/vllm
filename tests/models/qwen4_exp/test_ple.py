@@ -224,6 +224,38 @@ def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
     )
 
 
+def test_ngram_gpu_offload_accepts_scaleless_group_without_table(monkeypatch) -> None:
+    """A weight group carrying no PLE table owes no scale.
+
+    AutoWeightsLoader dispatches contiguous prefix groups, so load_weights runs
+    once per group. Checkpoints that keep the FP8 table and its scale in
+    dedicated shards reach this branch first with only the plain buffers, and
+    must not be rejected for the scale that a later group supplies.
+    """
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module._offload_quant_method = Qwen4ExpPLEFp8EmbeddingMethod()
+    monkeypatch.setattr(ple_layer_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: False)
+
+    loaded = module.load_weights([("ngram_embedding.token_lookup", torch.empty(4))])
+
+    assert loaded == set()
+    assert not hasattr(module, "_offload_weight_scale")
+
+
+def test_ngram_gpu_offload_still_requires_scale_beside_table(monkeypatch) -> None:
+    """The group that does carry the table is the one that owes the scale."""
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module._offload_quant_method = Qwen4ExpPLEFp8EmbeddingMethod()
+    monkeypatch.setattr(ple_layer_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: False)
+
+    with pytest.raises(ValueError, match="missing its scale"):
+        module.load_weights([("ngram_embedding.shard_0.weight", torch.empty(4, 2))])
+
+
 def test_ngram_gpu_offload_accepts_unquantized_embedding(monkeypatch) -> None:
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
