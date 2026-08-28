@@ -298,6 +298,7 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_PLE_CPU_OFFLOAD: bool = False
+    VLLM_PLE_FP8_CHECKPOINT: bool = False
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -2045,6 +2046,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # implementation supports ModelRunner V1 and single-node TP only.
     "VLLM_PLE_CPU_OFFLOAD": lambda: (
         os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1")
+    ),
+    # Treat the PLE table as an FP8 checkpoint regardless of the model-level
+    # quantization config. ModelOpt NVFP4 exports list "*.ple.*" in `ignore`
+    # while still shipping float8_e4m3 PLE shards, so auto-detection cannot
+    # tell the table is quantized and would load it unpacked.
+    "VLLM_PLE_FP8_CHECKPOINT": lambda: (
+        os.getenv("VLLM_PLE_FP8_CHECKPOINT", "False").lower() in ("true", "1")
     ),
     # Timeout for PLE weight loading and TP worker registration.
     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(

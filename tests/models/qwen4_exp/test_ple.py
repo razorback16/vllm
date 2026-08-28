@@ -892,3 +892,71 @@ def test_ple_short_conv_uses_fallback_when_profile_metadata_is_omitted(
     output = module._short_conv(inputs)
 
     assert output is expected
+
+
+class TestPleFp8CheckpointOverride:
+    """A checkpoint can ship an FP8 PLE table alongside a differently
+    quantized body. ModelOpt NVFP4 exports list ``*.ple.*`` in ``ignore``
+    while still writing float8_e4m3 PLE shards, so nothing in the config
+    reveals that the table is quantized and it would load unpacked.
+    ``VLLM_PLE_FP8_CHECKPOINT`` states outright that the shards are FP8.
+    """
+
+    PREFIX = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+
+    @staticmethod
+    def _nvfp4_config_excluding_ple() -> ModelOptNvFp4Config:
+        config = ModelOptNvFp4Config.__new__(ModelOptNvFp4Config)
+        config.is_checkpoint_nvfp4_serialized = True
+        config.is_layer_excluded = lambda prefix: True
+        return config
+
+    def test_override_forces_fp8_when_nvfp4_excludes_ple(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The real Qwen3.8-Flash-Next-NVFP4 shape: body is NVFP4, PLE is
+        excluded from it, and the PLE shards on disk are FP8."""
+        monkeypatch.setenv("VLLM_PLE_FP8_CHECKPOINT", "1")
+
+        method = _get_ple_embedding_quant_method(
+            self._nvfp4_config_excluding_ple(), self.PREFIX
+        )
+
+        assert isinstance(method, Qwen4ExpPLEFp8EmbeddingMethod)
+
+    def test_excluded_ple_stays_unquantized_without_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guards the default: the override must be opt-in, never implied by
+        an NVFP4 config that excludes the PLE table."""
+        monkeypatch.delenv("VLLM_PLE_FP8_CHECKPOINT", raising=False)
+
+        method = _get_ple_embedding_quant_method(
+            self._nvfp4_config_excluding_ple(), self.PREFIX
+        )
+
+        assert method is None
+
+    def test_override_applies_without_any_quant_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_PLE_FP8_CHECKPOINT", "1")
+
+        method = _get_ple_embedding_quant_method(None, self.PREFIX)
+
+        assert isinstance(method, Qwen4ExpPLEFp8EmbeddingMethod)
+
+    def test_unset_override_leaves_autodetection_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An FP8-serialized checkpoint must still be detected on its own."""
+        monkeypatch.delenv("VLLM_PLE_FP8_CHECKPOINT", raising=False)
+        config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            ignored_layers=[],
+            weight_block_size=[128, 128],
+        )
+
+        method = _get_ple_embedding_quant_method(config, self.PREFIX)
+
+        assert isinstance(method, Qwen4ExpPLEFp8EmbeddingMethod)

@@ -291,6 +291,18 @@ def _get_ple_embedding_quant_method(
 ) -> QuantizeMethodBase | None:
     """Select a packed PLE embedding method for quantized checkpoint shards."""
 
+    # A checkpoint can ship an FP8 PLE table alongside a differently quantized
+    # body. ModelOpt NVFP4 exports list "*.ple.*" in ``ignore`` -- correct, the
+    # table is not NVFP4 -- while still writing float8_e4m3 PLE shards, so the
+    # config alone cannot reveal that the table is quantized at all and the
+    # checks below would load ~51GiB unpacked. The override states outright
+    # that the PLE shards are FP8.
+    if envs.VLLM_PLE_FP8_CHECKPOINT:
+        logger.info_once(
+            "PLE embedding %s treated as FP8 (VLLM_PLE_FP8_CHECKPOINT)", prefix
+        )
+        return Qwen4ExpPLEFp8EmbeddingMethod()
+
     if isinstance(quant_config, Fp8Config):
         if not quant_config.is_checkpoint_fp8_serialized:
             return None
