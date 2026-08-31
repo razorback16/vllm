@@ -101,6 +101,35 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         return False
 
 
+_FP8_E4M3_MAX = 448.0
+
+# Below this many query rows the batch is decode-shaped: the attention dots are
+# far too small to reach tensor-core throughput, so the FP8 query buys nothing
+# while its amax reduction adds two launches per layer to a step that is already
+# launch-bound. Measured: FP8 query costs ~15% of decode and gains ~7% of prefill.
+_FP8_QUERY_MIN_ROWS = 32
+
+
+def _quantize_query_fp8(query: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cast a query to FP8 with a dynamic per-tensor scale.
+
+    The checkpoint carries no calibrated query scale. A static 1.0 would leave
+    most of the E4M3 range unused and, worse, saturate to infinity for any
+    activation above 448 -- an unknown risk across a 262k context. One amax
+    over the query removes that cliff for well under a percent of a step.
+
+    Returns:
+        The FP8 query and the scale needed to undo it, which the kernel folds
+        into the softmax scale.
+    """
+    amax = query.abs().amax().float()
+    scale = (amax / _FP8_E4M3_MAX).clamp(min=torch.finfo(torch.float32).tiny)
+    # Reciprocal in the query dtype keeps the multiply from widening to fp32;
+    # its error is far below the 3-bit mantissa the cast rounds to anyway.
+    inv = scale.reciprocal().to(query.dtype)
+    return (query * inv).to(torch.float8_e4m3fn), scale
+
+
 class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     """Run paged sparse GQA with the QSA Triton kernel."""
 
@@ -136,7 +165,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 f"Qwen4Exp QSA: KV cache dtype {self.kv_cache_dtype} is not "
                 "supported (bf16 and fp8_e4m3 are)"
             )
-        self.supports_quant_query_input = False
+        # Attention.forward is what normally consumes this flag, but the QSA
+        # owner calls its custom op directly and never goes through it, so the
+        # query is quantised in forward_qsa instead.
+        self.supports_quant_query_input = self.kv_cache_dtype in self._FP8_KV_DTYPES
 
     def forward_qsa(
         self,
@@ -189,8 +221,16 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         from .ops.qsa import qsa_sparse_paged_attention
 
         fp8_kv = key_cache.dtype is torch.float8_e4m3fn
+        attn_query = query[:num_tokens]
+        q_scale = None
+        if (
+            fp8_kv
+            and self.supports_quant_query_input
+            and num_tokens >= _FP8_QUERY_MIN_ROWS
+        ):
+            attn_query, q_scale = _quantize_query_fp8(attn_query)
         qsa_sparse_paged_attention(
-            query[:num_tokens],
+            attn_query,
             key_cache,
             value_cache,
             logical_indices,
@@ -199,6 +239,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             output[:num_tokens],
             k_scale=getattr(layer, "_k_scale", None) if fp8_kv else None,
             v_scale=getattr(layer, "_v_scale", None) if fp8_kv else None,
+            q_scale=q_scale,
         )
         return output
 

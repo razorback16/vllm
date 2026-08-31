@@ -10,7 +10,6 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
-from vllm.v1.attention.ops.triton_unified_attention import _cast_kv_tile
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
@@ -218,7 +217,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     num_requests,
     k_scale_ptr,
     v_scale_ptr,
+    q_scale_ptr,
     KV_QUANT_MODE: tl.constexpr,
+    Q_IS_FP8: tl.constexpr,
     TOPK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
@@ -253,6 +254,18 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
+
+    # Per-tensor FP8 scales are folded into the softmax scale and the output
+    # instead of being applied to each K/V tile. The per-tile multiply had to
+    # widen the tile to fp32, which doubled shared memory and cost half of
+    # BLOCK_N; folding keeps the tile at its stored width.
+    score_scale = softmax_scale_log2
+    value_scale = 1.0
+    if KV_QUANT_MODE == 1:
+        score_scale = softmax_scale_log2 * tl.load(k_scale_ptr)
+        value_scale = tl.load(v_scale_ptr)
+        if Q_IS_FP8:
+            score_scale = score_scale * tl.load(q_scale_ptr)
 
     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
     split_tile_start = split_id * NUM_TILES // NUM_SPLITS
@@ -301,11 +314,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
-        keys = _cast_kv_tile(keys, query, k_scale_ptr, KV_QUANT_MODE)
-        values = _cast_kv_tile(values, query, v_scale_ptr, KV_QUANT_MODE)
+        # A no-op when the query is FP8 too, which is what lets the dot issue
+        # on FP8 tensor cores instead of widening K to the query dtype first.
+        keys = keys.to(query.dtype)
+        values = values.to(query.dtype)
         scores = tl.dot(query, keys)
-        # Scaling scores avoids re-quantizing a scaled query to BF16.
-        scores *= softmax_scale_log2
+        scores *= score_scale
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
         alpha = tl.math.exp2(max_value - next_max)
@@ -319,6 +333,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         )
         normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
         max_value = next_max
+
+    accumulator *= value_scale
 
     has_values = normalizer > 0
     normalized_output = tl.where(
@@ -825,8 +841,13 @@ def qsa_sparse_paged_attention(
     out: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA over paged K/V caches, in BF16 or per-tensor FP8."""
+    """Run sparse GQA over paged K/V caches, in BF16 or per-tensor FP8.
+
+    An FP8 query is only accepted alongside an FP8 cache, and makes both dots
+    run at FP8 tensor-core width.
+    """
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
@@ -844,9 +865,15 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == torch.bfloat16, "QSA sparse attention requires a BF16 query"
+    _q_is_fp8 = q.dtype is torch.float8_e4m3fn
+    assert q.dtype == torch.bfloat16 or _q_is_fp8, (
+        f"QSA sparse attention: query is {q.dtype}, expected bf16 or fp8_e4m3"
+    )
     assert k_cache.dtype == v_cache.dtype, "QSA K and V caches must share a dtype"
     _fp8_kv = k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    assert not _q_is_fp8 or _fp8_kv, (
+        "QSA sparse attention: an FP8 query needs an FP8 KV cache"
+    )
     assert k_cache.dtype == torch.bfloat16 or _fp8_kv, (
         f"QSA sparse attention: KV cache is {k_cache.dtype}, expected bf16 or fp8"
     )
@@ -862,10 +889,11 @@ def qsa_sparse_paged_attention(
     assert logical_indices.stride(1) == block_table.stride(1) == 1
     assert token_to_req.stride(0) == 1
     if out is None:
-        out = torch.empty_like(q)
+        # bf16 even for an FP8 query: the accumulator is descaled on store.
+        out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     if out.shape != q.shape:
         raise ValueError("QSA sparse output must match its query")
-    assert out.dtype == q.dtype and out.device == q.device
+    assert out.dtype == torch.bfloat16 and out.device == q.device
     assert out.stride(2) == 1
     if not q.shape[0]:
         return out
@@ -888,11 +916,10 @@ def qsa_sparse_paged_attention(
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
 
-    if _kv_mode != 0:
-        # _cast_kv_tile materialises an fp32 tile, doubling shared memory for K
-        # and V. sm_120 and sm_121 both cap an opt-in block at 101376 bytes and
-        # the unhalved tile asks for 106496; halving the N block fits.
-        block_n = max(16, block_n // 2)
+    if _q_is_fp8:
+        # The P@V dot contracts over BLOCK_N, and an FP8 MMA needs K >= 32.
+        # Decode-shaped launches would otherwise pick 16 and fail to compile.
+        block_n = max(block_n, 32)
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
     max_useful_splits = 1 << (num_tiles.bit_length() - 1)
@@ -918,6 +945,7 @@ def qsa_sparse_paged_attention(
     _one = torch.ones((), dtype=torch.float32, device=q.device)
     _k_scale_t = k_scale if k_scale is not None else _one
     _v_scale_t = v_scale if v_scale is not None else _one
+    _q_scale_t = q_scale if q_scale is not None else _one
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
@@ -946,7 +974,9 @@ def qsa_sparse_paged_attention(
         block_table.shape[0],
         _k_scale_t,
         _v_scale_t,
+        _q_scale_t,
         KV_QUANT_MODE=_kv_mode,
+        Q_IS_FP8=_q_is_fp8,
         TOPK=logical_indices.shape[1],
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],

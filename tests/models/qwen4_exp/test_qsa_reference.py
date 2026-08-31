@@ -845,6 +845,69 @@ def test_qsa_sparse_paged_attention_applies_fp8_kv_scales() -> None:
 
 
 @requires_qsa_kernels
+def test_qsa_sparse_paged_attention_matches_reference_with_fp8_query() -> None:
+    """An FP8 query must fold its scale in, not silently change the result.
+
+    This is the path that keeps both dots at FP8 tensor-core width, so the
+    query scale is applied to the scores rather than to the tiles. Tolerance is
+    looser than the BF16-query case because E4M3 carries three mantissa bits.
+    """
+    q, k_cache, v_cache, logical_indices, block_table, token_to_req, scale = (
+        _build_sparse_paged_case(16, 12, 1, 1024)
+    )
+    head_dim = q.shape[-1]
+    k_scale = (k_cache.abs().amax() / 448.0).float()
+    v_scale = (v_cache.abs().amax() / 448.0).float()
+    q_scale = (q.abs().amax() / 448.0).float()
+    kv_fp8 = torch.cat([k_cache / k_scale, v_cache / v_scale], dim=-1).to(
+        torch.float8_e4m3fn
+    )
+    k_fp8, v_fp8 = kv_fp8.split(head_dim, dim=-1)
+    q_fp8 = (q / q_scale).to(torch.float8_e4m3fn)
+
+    actual = qsa_ops.qsa_sparse_paged_attention(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        logical_indices,
+        block_table,
+        token_to_req,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        q_scale=q_scale,
+    )
+    assert actual.dtype == torch.bfloat16
+    expected = _qsa_sparse_paged_attention_reference(
+        (q_fp8.to(torch.float32) * q_scale).to(torch.bfloat16),
+        (k_fp8.to(torch.float32) * k_scale).to(torch.bfloat16),
+        (v_fp8.to(torch.float32) * v_scale).to(torch.bfloat16),
+        logical_indices,
+        block_table,
+        token_to_req,
+        scale,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
+
+
+@requires_qsa_kernels
+def test_qsa_sparse_paged_attention_rejects_fp8_query_with_bf16_cache() -> None:
+    """FP8 query against a BF16 cache has no scale to fold and must not run."""
+    q, k_cache, v_cache, logical_indices, block_table, token_to_req, _ = (
+        _build_sparse_paged_case(16, 12, 1, 1024)
+    )
+    with pytest.raises(AssertionError, match="FP8 query needs an FP8 KV cache"):
+        qsa_ops.qsa_sparse_paged_attention(
+            (q / (q.abs().amax() / 448.0)).to(torch.float8_e4m3fn),
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+        )
+
+
+@requires_qsa_kernels
 def test_qsa_selection_chunks_workspace_and_matches_test_reference(
     monkeypatch: pytest.MonkeyPatch,
     workspace_init,
