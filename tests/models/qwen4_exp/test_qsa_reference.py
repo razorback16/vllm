@@ -682,24 +682,13 @@ def test_qsa_block_expansion_matches_test_reference() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-@requires_qsa_kernels
-@pytest.mark.parametrize(
-    ("num_rows", "num_query_heads", "num_kv_heads", "page_size"),
-    [
-        # Kernel-visible pages with --block-size 256 and hybrid-cache alignment.
-        pytest.param(1, 24, 2, 1792, id="tp1_split64"),
-        pytest.param(16, 12, 1, 1792, id="tp2_split32"),
-        pytest.param(32, 6, 1, 1024, id="tp4_split8"),
-        pytest.param(257, 6, 1, 1024, id="tp4_split4"),
-        pytest.param(513, 6, 1, 1024, id="tp4_split1"),
-    ],
-)
-def test_qsa_sparse_paged_attention_matches_test_reference(
+def _build_sparse_paged_case(
     num_rows: int,
     num_query_heads: int,
     num_kv_heads: int,
     page_size: int,
-) -> None:
+):
+    """Synthesise a paged QSA case and the top-k selection the kernel expects."""
     torch.manual_seed(2)
     head_dim = 256
     num_requests = 2
@@ -766,6 +755,30 @@ def test_qsa_sparse_paged_attention_matches_test_reference(
     assert logical_indices.shape == (num_rows, selection_width)
     scale = q.shape[-1] ** -0.5
 
+    return q, k_cache, v_cache, logical_indices, block_table, token_to_req, scale
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize(
+    ("num_rows", "num_query_heads", "num_kv_heads", "page_size"),
+    [
+        # Kernel-visible pages with --block-size 256 and hybrid-cache alignment.
+        pytest.param(1, 24, 2, 1792, id="tp1_split64"),
+        pytest.param(16, 12, 1, 1792, id="tp2_split32"),
+        pytest.param(32, 6, 1, 1024, id="tp4_split8"),
+        pytest.param(257, 6, 1, 1024, id="tp4_split4"),
+        pytest.param(513, 6, 1, 1024, id="tp4_split1"),
+    ],
+)
+def test_qsa_sparse_paged_attention_matches_test_reference(
+    num_rows: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> None:
+    q, k_cache, v_cache, logical_indices, block_table, token_to_req, scale = (
+        _build_sparse_paged_case(num_rows, num_query_heads, num_kv_heads, page_size)
+    )
     actual = qsa_ops.qsa_sparse_paged_attention(
         q,
         k_cache,
@@ -785,6 +798,50 @@ def test_qsa_sparse_paged_attention_matches_test_reference(
     )
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@requires_qsa_kernels
+def test_qsa_sparse_paged_attention_applies_fp8_kv_scales() -> None:
+    """An FP8 cache must be dequantised with the layer's scales.
+
+    Comparing against a reference fed the *dequantised* cache isolates the
+    scaling from FP8 rounding: if the kernel ignored the scales and assumed
+    1.0, the scores would be off by the scale factor and this would fail.
+    """
+    q, k_cache, v_cache, logical_indices, block_table, token_to_req, scale = (
+        _build_sparse_paged_case(16, 12, 1, 1024)
+    )
+    head_dim = q.shape[-1]
+    k_scale = (k_cache.abs().amax() / 448.0).float()
+    v_scale = (v_cache.abs().amax() / 448.0).float()
+    # Round-trip through the packed layout so the kernel sees the same strided
+    # split it gets from a real paged cache.
+    kv_fp8 = torch.cat([k_cache / k_scale, v_cache / v_scale], dim=-1).to(
+        torch.float8_e4m3fn
+    )
+    k_fp8, v_fp8 = kv_fp8.split(head_dim, dim=-1)
+
+    actual = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        k_fp8,
+        v_fp8,
+        logical_indices,
+        block_table,
+        token_to_req,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    expected = _qsa_sparse_paged_attention_reference(
+        q,
+        (k_fp8.to(torch.float32) * k_scale).to(torch.bfloat16),
+        (v_fp8.to(torch.float32) * v_scale).to(torch.bfloat16),
+        logical_indices,
+        block_table,
+        token_to_req,
+        scale,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
 
 
 @requires_qsa_kernels
