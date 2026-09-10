@@ -706,6 +706,7 @@ class EngineArgs:
 
     generation_config: str = ModelConfig.generation_config
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
+    sleep_mode_backend: str = ModelConfig.sleep_mode_backend
     enable_cumem_allocator: bool = ModelConfig.enable_cumem_allocator
     override_generation_config: dict[str, Any] = get_field(
         ModelConfig, "override_generation_config"
@@ -925,6 +926,9 @@ class EngineArgs:
         )
         model_group.add_argument(
             "--enable-sleep-mode", **model_kwargs["enable_sleep_mode"]
+        )
+        model_group.add_argument(
+            "--sleep-mode-backend", **model_kwargs["sleep_mode_backend"]
         )
         model_group.add_argument(
             "--enable-cumem-allocator", **model_kwargs["enable_cumem_allocator"]
@@ -1812,6 +1816,7 @@ class EngineArgs:
             generation_config=self.generation_config,
             override_generation_config=self.override_generation_config,
             enable_sleep_mode=self.enable_sleep_mode,
+            sleep_mode_backend=self.sleep_mode_backend,
             enable_cumem_allocator=self.enable_cumem_allocator,
             model_impl=self.model_impl,
             logits_processors=self.logits_processors,

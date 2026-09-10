@@ -20,11 +20,13 @@ Class structure mirrors the GPU worker pattern in multiproc_executor.py:
 """
 
 import contextlib
+import gc
 import multiprocessing.process
 import pickle
 import signal
 import tempfile
 import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
@@ -62,6 +64,7 @@ from vllm.v1.ple_offload.protocol import (
     PleOffloadRegistration,
     PleOffloadRequest,
 )
+from vllm.v1.ple_offload.table_cache import PleTableCache
 
 logger = init_logger(__name__)
 
@@ -339,6 +342,8 @@ class PleOffloadRunner:
         self._pinned_bufs: dict[int, dict[str, torch.Tensor]] = {}
         # Shared-memory inputs are registered once per DP rank by TP rank zero.
         self._input_bufs: dict[int, PleOffloadInputBuffers] = {}
+        # Set by _load_weights via _cache_tables; None when disk backing is off.
+        self._table_cache: PleTableCache | None = None
         self._load_weights()
 
     @property
@@ -468,7 +473,49 @@ class PleOffloadRunner:
 
         self._layers.update(offload_layers)
         del model
+        self._cache_tables()
         logger.info("PLE weight loading complete.")
+
+    def _cache_tables(self) -> None:
+        """Move the loaded tables onto disk-backed mappings, if configured.
+
+        The tables are read-only lookup data and are large: on a Flash-Next
+        NVFP4 checkpoint they are ~49 GiB of anonymous memory that the kernel
+        can never reclaim, held for as long as the server runs. Backing them
+        with a file makes those pages evictable page cache instead, which is
+        what lets a parked model give its host memory back.
+        """
+        root = envs.VLLM_PLE_TABLE_CACHE
+        if not root:
+            self._table_cache = None
+            return
+
+        model_config = self.vllm_config.model_config
+        key = "|".join(
+            [
+                str(model_config.model),
+                str(model_config.revision),
+                str(model_config.dtype),
+                f"fp8={envs.VLLM_PLE_FP8_CHECKPOINT}",
+                ",".join(sorted(self._layers)),
+            ]
+        )
+        cache = PleTableCache(root, key, ttl=envs.VLLM_PLE_TABLE_CACHE_TTL)
+        try:
+            if cache.matches(self._layers):
+                logger.info("PLE table cache: reusing %s", cache.dir)
+                cache.attach(self._layers)
+            else:
+                logger.info("PLE table cache: building %s", cache.dir)
+                cache.build(self._layers)
+        except Exception:
+            # A cache failure must not take the server down; the tables are
+            # already loaded and correct in anonymous memory.
+            logger.exception("PLE table cache: falling back to in-memory tables")
+            self._table_cache = None
+            return
+        self._table_cache = cache
+        gc.collect()
 
     def accept_registrations(
         self,
@@ -591,9 +638,29 @@ class PleOffloadRunner:
         logger.info("Busy-loop started.")
         poller = zmq.Poller()
         poller.register(pull_socket, zmq.POLLIN)
+        cache = self._table_cache
+        ttl = cache.ttl if cache is not None and cache.enabled else 0.0
+        last_request = time.monotonic()
+        dropped = False
         while not shutdown_event.is_set():
             if pull_socket not in dict(poller.poll(timeout=100)):
+                # The poll timeout is the only idle tick this process gets, so
+                # it is also where the tables are released. Dropping them here
+                # rather than waiting for kernel memory pressure is what makes a
+                # parked model actually give its DRAM back, and it needs no
+                # coordination with the GPU worker: the next request faults the
+                # pages straight back in from NVMe.
+                if ttl and not dropped and time.monotonic() - last_request > ttl:
+                    freed = cache.drop()
+                    dropped = True
+                    logger.info(
+                        "PLE table cache: released %.2f GiB after %.0fs idle",
+                        freed / 1024**3,
+                        ttl,
+                    )
                 continue
+            last_request = time.monotonic()
+            dropped = False
 
             requests = []
             try:

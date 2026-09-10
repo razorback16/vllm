@@ -300,6 +300,8 @@ if TYPE_CHECKING:
     VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_PLE_FP8_CHECKPOINT: bool = False
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
+    VLLM_PLE_TABLE_CACHE: str = ""
+    VLLM_PLE_TABLE_CACHE_TTL: float = 0.0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2055,6 +2057,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_PLE_FP8_CHECKPOINT", "False").lower() in ("true", "1")
     ),
     # Timeout for PLE weight loading and TP worker registration.
+    # Directory holding an mmap-backed copy of the PLE embedding tables. When
+    # set, the offload worker maps the tables from disk instead of holding them
+    # in anonymous memory, so the kernel can reclaim them under pressure. Empty
+    # disables it and the tables stay resident, as before.
+    "VLLM_PLE_TABLE_CACHE": lambda: os.getenv("VLLM_PLE_TABLE_CACHE", ""),
+    # Seconds of offload-worker idleness after which the mapped tables are
+    # dropped from the page cache. Requires VLLM_PLE_TABLE_CACHE. 0 disables the
+    # drop and leaves reclaim entirely to the kernel.
+    "VLLM_PLE_TABLE_CACHE_TTL": lambda: float(
+        os.getenv("VLLM_PLE_TABLE_CACHE_TTL", "0")
+    ),
     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
         os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
     ),
