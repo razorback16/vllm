@@ -1315,3 +1315,190 @@ def test_qsa_streaming_compression_and_compressor_state_store_match_reference() 
                 rope_cache[block, position % 4, 0],
                 position_row(request, position).to("cuda"),
             )
+
+
+def _small_sparse_paged_case(num_rows: int = 32):
+    """A small paged QSA case plus the packed top-k selection the kernel reads."""
+    torch.manual_seed(2)
+    num_query_heads, num_kv_heads, page_size, num_requests = 4, 1, 64, 2
+    head_dim = 256
+    num_selected_pages = 8
+    num_pages_per_request = num_selected_pages + 1
+    num_cache_blocks = num_requests * num_pages_per_request
+    indexer_budget, indexer_compress_ratio = 2048, 4
+    selection_width = indexer_budget + indexer_compress_ratio - 1
+
+    q = torch.randn(
+        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv_cache = torch.randn(
+        num_cache_blocks,
+        page_size,
+        num_kv_heads,
+        2 * head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    block_table = (
+        torch.randperm(num_cache_blocks, device="cuda")
+        .reshape(num_requests, num_pages_per_request)
+        .to(torch.int32)
+    )
+    rows_per_request = math.ceil(num_rows / num_requests)
+    row_indices = torch.arange(num_rows, device="cuda", dtype=torch.int32)
+    token_to_req = row_indices // rows_per_request
+    request_row_counts = torch.full(
+        (num_requests,), rows_per_request, device="cuda", dtype=torch.int32
+    )
+    request_row_counts[-1] = num_rows - rows_per_request * (num_requests - 1)
+    context_lengths = torch.full(
+        (num_requests,),
+        num_pages_per_request * page_size - 1,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    block_topk = indexer_budget // indexer_compress_ratio
+    compressed_blocks_per_page = page_size // indexer_compress_ratio
+    selection = torch.arange(block_topk, device="cuda")
+    selected_pages = selection % num_selected_pages
+    selected_offsets = selection // num_selected_pages
+    selected_offsets = (
+        selected_offsets + 2 * row_indices.unsqueeze(1)
+    ) % compressed_blocks_per_page
+    block_indices = (selected_pages * compressed_blocks_per_page + selected_offsets).to(
+        torch.int32
+    )
+    rows_within_request = row_indices % rows_per_request
+    query_positions = (
+        context_lengths[token_to_req.long()]
+        - request_row_counts[token_to_req.long()]
+        + rows_within_request
+    ).to(torch.int64)
+    visible_blocks = torch.minimum(
+        (query_positions + 1) // indexer_compress_ratio,
+        context_lengths.index_select(0, token_to_req.long()) // indexer_compress_ratio,
+    ).to(torch.int32)
+    logical_indices = torch.empty(
+        (num_rows, selection_width + 1), device="cuda", dtype=torch.int32
+    )
+    qsa_indexer_ops.expand_qsa_block_indices(
+        block_indices,
+        query_positions,
+        visible_blocks,
+        indexer_compress_ratio,
+        indexer_budget,
+        logical_indices,
+    )
+    return q, kv_cache, block_table, token_to_req, logical_indices, selection_width
+
+
+def _quantize_per_tensor_fp8(tensor: torch.Tensor):
+    """Quantize to FP8 and return the tensor, its scale, and its dequantization."""
+    scale = (tensor.abs().amax().to(torch.float32) / 448.0).clamp(
+        min=torch.finfo(torch.float32).tiny
+    )
+    quantized = (tensor.to(torch.float32) / scale).to(torch.float8_e4m3fn)
+    return (
+        quantized,
+        scale.reshape(1),
+        (quantized.to(torch.float32) * scale).to(torch.bfloat16),
+    )
+
+
+@requires_qsa_kernels
+def test_qsa_sparse_paged_attention_applies_fp8_kv_scales() -> None:
+    """An FP8 cache must be read through its scales, not as raw FP8 magnitudes.
+
+    The scales are folded into the softmax scale and the output rather than
+    applied per tile, so a dropped scale is a silent numerical error rather than
+    a crash. Comparing against a reference on the DEQUANTIZED cache isolates the
+    kernel from the quantization error itself.
+    """
+    q, kv_cache, block_table, token_to_req, logical_indices, selection_width = (
+        _small_sparse_paged_case()
+    )
+    # The dynamic scale here lands near 1/110, so a dropped scale is a ~100x
+    # error; scaling the cache up instead would only saturate the softmax and
+    # test float range rather than the folding.
+    k_bf16, v_bf16 = kv_cache.split(256, dim=-1)
+    k_q, k_scale, k_deq = _quantize_per_tensor_fp8(k_bf16)
+    v_q, v_scale, v_deq = _quantize_per_tensor_fp8(v_bf16)
+
+    actual = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        k_q,
+        v_q,
+        logical_indices,
+        block_table,
+        token_to_req,
+        use_prefill_config=True,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    expected = _qsa_sparse_paged_attention_reference(
+        q,
+        k_deq,
+        v_deq,
+        logical_indices[:, :selection_width],
+        block_table,
+        token_to_req,
+        q.shape[-1] ** -0.5,
+    )
+    torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
+
+
+@requires_qsa_kernels
+def test_qsa_sparse_paged_attention_matches_reference_with_fp8_query() -> None:
+    """An FP8 query keeps both dots on FP8 tensor cores and stays accurate."""
+    q, kv_cache, block_table, token_to_req, logical_indices, selection_width = (
+        _small_sparse_paged_case()
+    )
+    k_bf16, v_bf16 = kv_cache.split(256, dim=-1)
+    k_q, k_scale, k_deq = _quantize_per_tensor_fp8(k_bf16)
+    v_q, v_scale, v_deq = _quantize_per_tensor_fp8(v_bf16)
+    q_q, q_scale, q_deq = _quantize_per_tensor_fp8(q)
+
+    actual = qsa_ops.qsa_sparse_paged_attention(
+        q_q,
+        k_q,
+        v_q,
+        logical_indices,
+        block_table,
+        token_to_req,
+        use_prefill_config=True,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        q_scale=q_scale,
+    )
+    assert actual.dtype is torch.bfloat16
+    expected = _qsa_sparse_paged_attention_reference(
+        q_deq,
+        k_deq,
+        v_deq,
+        logical_indices[:, :selection_width],
+        block_table,
+        token_to_req,
+        q.shape[-1] ** -0.5,
+    )
+    torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
+
+
+@requires_qsa_kernels
+def test_qsa_sparse_paged_attention_rejects_fp8_query_with_bf16_cache() -> None:
+    """An FP8 query against a BF16 cache would silently misscale the scores."""
+    q, kv_cache, block_table, token_to_req, logical_indices, _ = (
+        _small_sparse_paged_case()
+    )
+    k_bf16, v_bf16 = kv_cache.split(256, dim=-1)
+    q_q, q_scale, _ = _quantize_per_tensor_fp8(q)
+    with pytest.raises(AssertionError, match="FP8 query needs an FP8 KV cache"):
+        qsa_ops.qsa_sparse_paged_attention(
+            q_q,
+            k_bf16,
+            v_bf16,
+            logical_indices,
+            block_table,
+            token_to_req,
+            use_prefill_config=True,
+            q_scale=q_scale,
+        )

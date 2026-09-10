@@ -18,6 +18,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    # Per-tensor FP8 scales (1-element fp32 buffers). Only read when the cache
+    # is quantized; any valid pointer is passed on the BF16 path.
+    k_scale_ptr,
+    v_scale_ptr,
+    q_scale_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -49,6 +54,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_QUANT_MODE: tl.constexpr,
+    Q_IS_FP8: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -79,6 +86,19 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
+
+    # Per-tensor FP8 scales are folded into the softmax scale and the output
+    # rather than applied to each K/V tile. A per-tile multiply has to widen the
+    # tile to fp32, which doubles shared memory and forces a narrower BLOCK_N;
+    # folding keeps the tile at its stored width so both dots stay on FP8
+    # tensor cores.
+    score_scale = softmax_scale_log2
+    value_scale = 1.0
+    if KV_QUANT_MODE == 1:
+        score_scale = softmax_scale_log2 * tl.load(k_scale_ptr)
+        value_scale = tl.load(v_scale_ptr)
+        if Q_IS_FP8:
+            score_scale = score_scale * tl.load(q_scale_ptr)
 
     tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
 
@@ -126,9 +146,13 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        # A no-op when the query is FP8 too, which is what lets the dot issue
+        # on FP8 tensor cores instead of widening K to the query dtype first.
+        keys = keys.to(query.dtype)
+        values = values.to(query.dtype)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
-        scores *= softmax_scale_log2
+        scores *= score_scale
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
         alpha = tl.math.exp2(max_value - next_max)
@@ -142,6 +166,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         )
         normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
         max_value = next_max
+
+    accumulator *= value_scale
 
     has_values = normalizer > 0
     normalized_output = tl.where(
@@ -455,8 +481,14 @@ def qsa_sparse_paged_attention(
     token_to_req: torch.Tensor,
     use_prefill_config: bool,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches.
+    """Run sparse GQA over paged K/V caches, in BF16 or per-tensor FP8.
+
+    An FP8 query is only accepted alongside an FP8 cache; it makes both dots run
+    at FP8 tensor-core width. Output is always BF16.
 
     logical_indices is the PACKED selection buffer: [rows, selection_width + 1]
     with the trailing column holding each row's valid-entry count (written by
@@ -480,7 +512,24 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    _q_is_fp8 = q.dtype is torch.float8_e4m3fn
+    _fp8_kv = k_cache.dtype is torch.float8_e4m3fn
+    assert k_cache.dtype == v_cache.dtype
+    assert q.dtype is torch.bfloat16 or _q_is_fp8, (
+        "QSA sparse attention accepts a BF16 or FP8 query"
+    )
+    assert k_cache.dtype is torch.bfloat16 or _fp8_kv, (
+        "QSA sparse attention accepts a BF16 or FP8 KV cache"
+    )
+    assert not _q_is_fp8 or _fp8_kv, (
+        "QSA sparse attention: an FP8 query needs an FP8 KV cache"
+    )
+    assert not _fp8_kv or (k_scale is not None and v_scale is not None), (
+        "QSA sparse attention: an FP8 KV cache needs k_scale and v_scale"
+    )
+    assert not _q_is_fp8 or q_scale is not None, (
+        "QSA sparse attention: an FP8 query needs q_scale"
+    )
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -491,10 +540,10 @@ def qsa_sparse_paged_attention(
     assert token_to_req.stride(0) == 1
 
     if out is None:
-        out = torch.empty_like(q)
+        out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     if out.shape != q.shape:
         raise ValueError("QSA sparse output must match its query")
-    assert out.dtype == q.dtype and out.device == q.device
+    assert out.dtype is torch.bfloat16 and out.device == q.device
     assert out.stride(2) == 1
     if not q.shape[0]:
         return out
@@ -523,10 +572,19 @@ def qsa_sparse_paged_attention(
         )
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+    # Triton needs a real pointer even for compiled-out branches; on the BF16
+    # path the query buffer stands in and is never dereferenced.
+    _k_scale_t = k_scale if _fp8_kv else q
+    _v_scale_t = v_scale if _fp8_kv else q
+    _q_scale_t = q_scale if _q_is_fp8 else q
+
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
         k_cache,
         v_cache,
+        _k_scale_t,
+        _v_scale_t,
+        _q_scale_t,
         logical_indices,
         block_table,
         token_to_req,
@@ -558,6 +616,8 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        KV_QUANT_MODE=1 if _fp8_kv else 0,
+        Q_IS_FP8=_q_is_fp8,
         num_warps=partial_warps,
         num_stages=2,
     )
@@ -629,9 +689,23 @@ def warmup_qsa_sparse_paged_attention(
         strides=tuple(block_table.stride()),
     )
     token_to_req_ptr = TritonWarmupTensor(torch.int32)
+    scale_ptr = TritonWarmupTensor(torch.float32, shape=(1,))
     output_ptr = TritonWarmupTensor(
         torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
     )
+    kv_quant_mode = 1 if key_cache.dtype is torch.float8_e4m3fn else 0
+    # An FP8 cache is read by both widths of query: decode keeps BF16 (the
+    # quantization does not pay for itself on small batches), prefill sends FP8.
+    q_variants = [(q_ptr, False)]
+    if kv_quant_mode:
+        q_variants.append(
+            (
+                TritonWarmupTensor(
+                    torch.float8_e4m3fn, shape=(num_rows, num_query_heads, head_dim)
+                ),
+                True,
+            )
+        )
     head_stride = head_dim
     row_stride = num_query_heads * head_dim
     num_cache_blocks = triton_scalar_specialization_rep(kv_cache.shape[0])
@@ -649,45 +723,51 @@ def warmup_qsa_sparse_paged_attention(
             partial_lse_ptr = TritonWarmupTensor(
                 torch.float32, shape=(num_splits, num_rows, num_query_heads)
             )
-        _qsa_sparse_paged_gqa_splitk_kernel.warmup(
-            q_ptr,
-            k_cache_ptr,
-            v_cache_ptr,
-            indices_ptr,
-            block_table_ptr,
-            token_to_req_ptr,
-            partial_output_ptr,
-            partial_lse_ptr,
-            output_ptr,
-            row_stride,
-            head_stride,
-            key_cache.stride(0),
-            key_cache.stride(1),
-            key_cache.stride(2),
-            value_cache.stride(0),
-            value_cache.stride(1),
-            value_cache.stride(2),
-            selection_width + 1,
-            block_table.stride(0),
-            row_stride,
-            head_stride,
-            num_rows,
-            num_cache_blocks,
-            num_requests,
-            TOPK=selection_width,
-            PAGE_SIZE=key_cache.shape[1],
-            PAGE_TABLE_WIDTH=block_table.shape[1],
-            GROUP_SIZE=group_size,
-            HEAD_DIM=head_dim,
-            NUM_QUERY_HEADS=num_query_heads,
-            NUM_SPLITS=num_splits,
-            NUM_TILES=num_tiles,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            num_warps=warps,
-            num_stages=2,
-            grid=(num_rows, num_kv_heads, num_splits),
-        )
+        for warm_q_ptr, q_is_fp8 in q_variants:
+            _qsa_sparse_paged_gqa_splitk_kernel.warmup(
+                warm_q_ptr,
+                k_cache_ptr,
+                v_cache_ptr,
+                scale_ptr,
+                scale_ptr,
+                scale_ptr,
+                indices_ptr,
+                block_table_ptr,
+                token_to_req_ptr,
+                partial_output_ptr,
+                partial_lse_ptr,
+                output_ptr,
+                row_stride,
+                head_stride,
+                key_cache.stride(0),
+                key_cache.stride(1),
+                key_cache.stride(2),
+                value_cache.stride(0),
+                value_cache.stride(1),
+                value_cache.stride(2),
+                selection_width + 1,
+                block_table.stride(0),
+                row_stride,
+                head_stride,
+                num_rows,
+                num_cache_blocks,
+                num_requests,
+                TOPK=selection_width,
+                PAGE_SIZE=key_cache.shape[1],
+                PAGE_TABLE_WIDTH=block_table.shape[1],
+                GROUP_SIZE=group_size,
+                HEAD_DIM=head_dim,
+                NUM_QUERY_HEADS=num_query_heads,
+                NUM_SPLITS=num_splits,
+                NUM_TILES=num_tiles,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                KV_QUANT_MODE=kv_quant_mode,
+                Q_IS_FP8=q_is_fp8,
+                num_warps=warps,
+                num_stages=2,
+                grid=(num_rows, num_kv_heads, num_splits),
+            )
         if num_splits > 1:
             _qsa_merge_splitk_kernel.warmup(
                 partial_output_ptr,
