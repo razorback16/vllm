@@ -115,6 +115,7 @@ def _denoise_once(
     slots: list[int],
     compute_sc: bool = True,
     width: int = CL,
+    embed_dtype: torch.dtype = torch.float32,
 ) -> None:
     """One compiled denoise step over ``slots`` with flat logits, so nothing
     converges by stability or confidence and only the step cap can end it.
@@ -136,8 +137,8 @@ def _denoise_once(
         states.is_encoder_phase,
         states.confident,
         states.self_conditioning_embeds[:, :width],
-        torch.zeros(VOCAB, 4, device=device),
-        torch.tensor(1.0, device=device),
+        torch.ones(VOCAB, 4, dtype=embed_dtype, device=device),
+        torch.tensor(1.0, dtype=embed_dtype, device=device),
         states.accepted_canvas_history[:, :, :width],
         states.accepted_canvas_history_len,
         states.max_steps,
@@ -169,6 +170,25 @@ def test_single_step_tile_skips_self_conditioning():
     _denoise_once(states, [0], compute_sc=False)
 
     assert not states.self_conditioning_embeds[0].any()
+
+
+@pytest.mark.parametrize("stance", ["default", "force_eager"])
+def test_self_conditioning_stores_a_bf16_model_in_the_fp32_buffer(stance):
+    # The model's embeddings are bf16 while the buffer is fp32. Compiled code
+    # casts on the store, but eager does not, and the step runs eager once
+    # torch.compile hits its recompile limit.
+    states = _states()
+    states.add_request(0)
+    states.is_encoder_phase[0] = False
+
+    with torch.compiler.set_stance(stance):
+        _denoise_once(states, [0], embed_dtype=torch.bfloat16)
+
+    assert states.self_conditioning_embeds.dtype == torch.float32
+    # uniform probs @ an all-ones embedding
+    assert torch.allclose(
+        states.self_conditioning_embeds[0], torch.ones(CL, 4, device="cuda")
+    )
 
 
 def test_narrow_tile_leaves_the_rest_of_the_canvas_alone():
